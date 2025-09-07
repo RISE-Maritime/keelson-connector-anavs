@@ -22,11 +22,13 @@ import keelson
 import sys
 import socket
 import struct
+import select
 from datetime import datetime, timedelta
 import pytz
 from terminal_inputs import terminal_inputs
 from keelson.payloads.Primitives_pb2 import TimestampedBytes, TimestampedInt, TimestampedFloat, TimestampedString, TimestampedTimestamp
 from keelson.payloads.foxglove.LocationFix_pb2 import LocationFix
+from keelson.payloads.Decomposed3DVector_pb2 import Decomposed3DVector
 
 # ANavS Binary Protocol Constants
 SYNC_CHAR_1 = 0xB5
@@ -36,11 +38,12 @@ MESSAGE_ID = 0xE0
 
 def fletcher_checksum(data):
     """Calculate Fletcher-16 checksum with modulo 256 as per ANavS spec."""
-    ck_a = 0
-    ck_b = 0
-    for byte in data:
-        ck_a = (ck_a + byte) % 256
-        ck_b = (ck_b + ck_a) % 256
+    # Optimized version using memoryview for better performance
+    view = memoryview(data)
+    ck_a = ck_b = 0
+    for byte in view:
+        ck_a = (ck_a + byte) & 0xFF  # Bitwise AND is faster than modulo
+        ck_b = (ck_b + ck_a) & 0xFF
     return ck_a, ck_b
 
 def parse_anavs_binary(data_buffer):
@@ -51,67 +54,67 @@ def parse_anavs_binary(data_buffer):
     """
     messages = []
     consumed = 0
+    buffer_len = len(data_buffer)
     
-    while len(data_buffer) >= 8:  # Minimum message size
+    # Pre-compile struct format for header parsing - this is safe
+    header_struct = struct.Struct('<BBBBH')
+    checksum_struct = struct.Struct('<BB')
+    
+    while consumed + 8 <= buffer_len:  # Minimum message size
         # Look for sync pattern
         sync_pos = -1
-        for i in range(len(data_buffer) - 1):
+        for i in range(consumed, buffer_len - 1):
             if data_buffer[i] == SYNC_CHAR_1 and data_buffer[i + 1] == SYNC_CHAR_2:
                 sync_pos = i
                 break
         
         if sync_pos == -1:
             # No sync found, consume all but last byte
-            consumed = max(0, len(data_buffer) - 1)
+            consumed = max(0, buffer_len - 1)
             break
             
         # Skip any bytes before sync
-        if sync_pos > 0:
-            consumed += sync_pos
-            data_buffer = data_buffer[sync_pos:]
-            logging.debug(f"Skipped {sync_pos} bytes to find sync")
-            continue
+        consumed = sync_pos
             
         # Check if we have enough bytes for header
-        if len(data_buffer) < 6:
+        remaining = buffer_len - consumed
+        if remaining < 6:
             break
             
-        # Parse header: sync1(1) + sync2(1) + class(1) + id(1) + length(2)
+        # Parse header using pre-compiled struct
         try:
-            sync1, sync2, msg_class, msg_id, length = struct.unpack('<BBBBH', data_buffer[:6])
+            sync1, sync2, msg_class, msg_id, length = header_struct.unpack(
+                data_buffer[consumed:consumed+6]
+            )
         except struct.error as e:
-            logging.warning(f"Header unpack error: {e}, buffer len: {len(data_buffer)}")
+            logging.warning(f"Header unpack error: {e}, buffer len: {remaining}")
             consumed += 2
-            data_buffer = data_buffer[2:]
             continue
         
         # Validate header
         if sync1 != SYNC_CHAR_1 or sync2 != SYNC_CHAR_2 or msg_class != CLASS_ID or msg_id != MESSAGE_ID:
-            # Invalid header, skip this sync and continue
-            logging.debug(f"Invalid header: sync={sync1:02x}{sync2:02x}, class={msg_class:02x}, id={msg_id:02x}")
             consumed += 2
-            data_buffer = data_buffer[2:]
             continue
             
         # Check if we have complete message
         total_msg_len = 6 + length + 2  # header + payload + checksum
-        if len(data_buffer) < total_msg_len:
-            logging.debug(f"Incomplete message: need {total_msg_len}, have {len(data_buffer)}")
+        if remaining < total_msg_len:
             break
             
         # Extract payload and checksum
-        payload = data_buffer[6:6+length]
-        checksum = data_buffer[6+length:6+length+2]
+        payload_start = consumed + 6
+        payload_end = payload_start + length
+        payload = data_buffer[payload_start:payload_end]
+        checksum = data_buffer[payload_end:payload_end+2]
         
         # Verify checksum
-        checksum_data = data_buffer[2:6+length]  # class + id + length + payload
+        checksum_data = data_buffer[consumed+2:payload_end]  # class + id + length + payload
         expected_ck_a, expected_ck_b = fletcher_checksum(checksum_data)
-        received_ck_a, received_ck_b = struct.unpack('<BB', checksum)
+        received_ck_a, received_ck_b = checksum_struct.unpack(checksum)
         
         if expected_ck_a != received_ck_a or expected_ck_b != received_ck_b:
             logging.warning(f"Checksum mismatch: expected {expected_ck_a:02x}{expected_ck_b:02x}, got {received_ck_a:02x}{received_ck_b:02x}")
             consumed += 2
-            data_buffer = data_buffer[2:]
             continue
             
         # Parse payload
@@ -125,7 +128,6 @@ def parse_anavs_binary(data_buffer):
             
         # Consume this message
         consumed += total_msg_len
-        data_buffer = data_buffer[total_msg_len:]
         
     return consumed, messages
 
@@ -341,77 +343,52 @@ def main():
         )
         logging.info(f"Created RAW publisher: {key_exp_pub_raw}")
 
-        # # Location fix publisher
-        # key_exp_pub_location_fix = keelson.construct_pubsub_key(
-        #     base_path=args.realm,
-        #     entity_id=args.entity_id,
-        #     subject="location_fix", 
-        #     source_id=args.source_id + "/binary",
-        # )
-        # logging.info(f"Created LocationFix publisher: {key_exp_pub_location_fix}")
-
-        # # ECEF position publisher
-        # key_exp_pub_ecef = keelson.construct_pubsub_key(
-        #     base_path=args.realm,
-        #     entity_id=args.entity_id,
-        #     subject="ecef_position", 
-        #     source_id=args.source_id + "/binary",
-        # )
-        # logging.info(f"Created ECEF publisher: {key_exp_pub_ecef}")
-
-        # # Velocity NED publisher
-        # key_exp_pub_velocity = keelson.construct_pubsub_key(
-        #     base_path=args.realm,
-        #     entity_id=args.entity_id,
-        #     subject="velocity_ned", 
-        #     source_id=args.source_id + "/binary",
-        # )
-        # logging.info(f"Created Velocity NED publisher: {key_exp_pub_velocity}")
-
-        # # Acceleration body publisher
-        # key_exp_pub_acceleration = keelson.construct_pubsub_key(
-        #     base_path=args.realm,
-        #     entity_id=args.entity_id,
-        #     subject="acceleration_body", 
-        #     source_id=args.source_id + "/binary",
-        # )
-        # logging.info(f"Created Acceleration Body publisher: {key_exp_pub_acceleration}")
-
-        # # Attitude publisher
-        # key_exp_pub_attitude = keelson.construct_pubsub_key(
-        #     base_path=args.realm,
-        #     entity_id=args.entity_id,
-        #     subject="attitude", 
-        #     source_id=args.source_id + "/binary",
-        # )
-        # logging.info(f"Created Attitude publisher: {key_exp_pub_attitude}")
-
-        # # Result code publisher
-        # key_exp_pub_result_code = keelson.construct_pubsub_key(
-        #     base_path=args.realm,
-        #     entity_id=args.entity_id,
-        #     subject="result_code", 
-        #     source_id=args.source_id + "/binary",
-        # )
-        # logging.info(f"Created Result Code publisher: {key_exp_pub_result_code}")
-
-        # # GPS timing publisher
-        # key_exp_pub_gps_timing = keelson.construct_pubsub_key(
-        #     base_path=args.realm,
-        #     entity_id=args.entity_id,
-        #     subject="gps_timing", 
-        #     source_id=args.source_id + "/binary",
-        # )
-        # logging.info(f"Created GPS Timing publisher: {key_exp_pub_gps_timing}")
-
-        # # UTC timestamp publisher
-        # key_exp_pub_utc_time = keelson.construct_pubsub_key(
-        #     base_path=args.realm,
-        #     entity_id=args.entity_id,
-        #     subject="utc_time", 
-        #     source_id=args.source_id + "/binary",
-        # )
-        # logging.info(f"Created UTC Time publisher: {key_exp_pub_utc_time}")
+        # Pre-compile all other key expressions for performance
+        key_expressions = {}
+        
+        if any(topic in args.publish for topic in ("location_fix", "all")):
+            key_expressions['location_fix'] = keelson.construct_pubsub_key(
+                base_path=args.realm,
+                entity_id=args.entity_id,
+                subject="location_fix", 
+                source_id=args.source_id,
+            )
+            
+        if any(topic in args.publish for topic in ("velocity", "all")):
+            key_expressions['velocity'] = keelson.construct_pubsub_key(
+                base_path=args.realm,
+                entity_id=args.entity_id,
+                subject="ned_velocity_mps", 
+                source_id=args.source_id,
+            )
+            
+        if any(topic in args.publish for topic in ("acceleration", "all")):
+            key_expressions['acceleration'] = keelson.construct_pubsub_key(
+                base_path=args.realm,
+                entity_id=args.entity_id,
+                subject="linear_acceleration_mpss", 
+                source_id=args.source_id + "/body_frame",
+            )
+            
+        if any(topic in args.publish for topic in ("attitude", "all")):
+            key_expressions['heading'] = keelson.construct_pubsub_key(
+                base_path=args.realm,
+                entity_id=args.entity_id,
+                subject="heading_true_north_deg", 
+                source_id=args.source_id,
+            )
+            key_expressions['pitch'] = keelson.construct_pubsub_key(
+                base_path=args.realm,
+                entity_id=args.entity_id,
+                subject="pitch_deg", 
+                source_id=args.source_id,
+            )
+            key_expressions['roll'] = keelson.construct_pubsub_key(
+                base_path=args.realm,
+                entity_id=args.entity_id,
+                subject="roll_deg", 
+                source_id=args.source_id,
+            )
 
         #################################################
         # Setup input stream
@@ -430,13 +407,15 @@ def main():
         # Main processing loop
 
         binary_buffer = bytearray()
+        chunk_size = 8192  # Increased buffer size for better performance
+        max_buffer_size = 32768  # Reduced max buffer size
         
         try:
             while True:
-                # Read data
+                # Read data with optimized chunk size
                 if args.input_mode == "tcp" and tcp_socket:
                     try:
-                        chunk = tcp_socket.recv(4096)
+                        chunk = tcp_socket.recv(chunk_size)
                         if not chunk:
                             logging.warning("TCP connection closed by remote")
                             break
@@ -446,9 +425,12 @@ def main():
                         logging.error(f"TCP read error: {e}")
                         break
                 else:
-                    chunk = sys.stdin.buffer.read(4096)
-                    if not chunk:
-                        time.sleep(0.001)
+                    # Non-blocking read from stdin with proper buffering
+                    if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
+                        chunk = sys.stdin.buffer.read(chunk_size)
+                        if not chunk:
+                            continue
+                    else:
                         continue
                 
                 ingress_timestamp = time.time_ns()
@@ -483,7 +465,7 @@ def main():
                         utc_timestamp = pos_data['utc_timestamp']
                         
                         # Publish LocationFix
-                        if any(topic in args.publish for topic in ("location_fix", "all")):
+                        if any(topic in args.publish for topic in ("location_fix", "all")) and 'location_fix' in key_expressions:
                             payload_location = LocationFix()
                             payload_location.timestamp.FromDatetime(message_timestamp)
                             payload_location.latitude = pos_data['lat']
@@ -492,229 +474,100 @@ def main():
                             
                             serialized_payload = payload_location.SerializeToString()
                             envelope = keelson.enclose(serialized_payload)
-                            key_exp_pub_location_fix = keelson.construct_pubsub_key(
-                                base_path=args.realm,
-                                entity_id=args.entity_id,
-                                subject="location_fix", 
-                                source_id=args.source_id + "/binary",
-                            )
                             session.put(
-                                key_expr=key_exp_pub_location_fix,
+                                key_expr=key_expressions['location_fix'],
                                 payload=envelope,
                                 priority=zenoh.Priority.INTERACTIVE_HIGH,
                                 congestion_control=zenoh.CongestionControl.DROP,
                             )
-                            logging.debug(f"Published LocationFix on {key_exp_pub_location_fix}")
+                            logging.debug(f"Published LocationFix on {key_expressions['location_fix']}")
 
-                        # Publish ECEF Position
-                        if any(topic in args.publish for topic in ("ecef", "all")):
-                            payload_ecef = TimestampedFloat()
-                            payload_ecef.timestamp.FromDatetime(message_timestamp)
-                            payload_ecef.value = pos_data['ecef_x']  # X component
-                            
-                            key_exp_pub_ecef_x = keelson.construct_pubsub_key(
-                                base_path=args.realm,
-                                entity_id=args.entity_id,
-                                subject="ecef_x", 
-                                source_id=args.source_id + "/binary",
-                            )
-                            serialized_payload = payload_ecef.SerializeToString()
+                        # Publish Velocity NED - Binary solution velocity (default) = fused GNSS+IMU (Kalman Filter output)
+                        if any(topic in args.publish for topic in ("velocity", "all")) and 'velocity' in key_expressions:
+                            payload_vel = Decomposed3DVector()
+                            payload_vel.timestamp.FromDatetime(message_timestamp)
+                            payload_vel.vector.x = pos_data['velocity_ned'][1]  # East
+                            payload_vel.vector.y = pos_data['velocity_ned'][0]  # North
+                            payload_vel.vector.z = -pos_data['velocity_ned'][2]  # Up (negated down)
+
+                            serialized_payload = payload_vel.SerializeToString()
                             envelope = keelson.enclose(serialized_payload)
                             session.put(
-                                key_expr=key_exp_pub_ecef_x,
+                                key_expr=key_expressions['velocity'],
                                 payload=envelope,
                                 priority=zenoh.Priority.INTERACTIVE_HIGH,
                                 congestion_control=zenoh.CongestionControl.DROP,
                             )
-                            logging.debug(f"Published ECEF X on {key_exp_pub_ecef_x}")
-                            
-                            # Similar for Y and Z components
-                            payload_ecef.value = pos_data['ecef_y']
-                            key_exp_pub_ecef_y = keelson.construct_pubsub_key(
-                                base_path=args.realm,
-                                entity_id=args.entity_id,
-                                subject="ecef_y", 
-                                source_id=args.source_id + "/binary",
-                            )
-                            serialized_payload = payload_ecef.SerializeToString()
-                            envelope = keelson.enclose(serialized_payload)
-                            session.put(key_expr=key_exp_pub_ecef_y, payload=envelope,
-                                        priority=zenoh.Priority.INTERACTIVE_HIGH,
-                                        congestion_control=zenoh.CongestionControl.DROP)
-                            
-                            payload_ecef.value = pos_data['ecef_z']
-                            key_exp_pub_ecef_z = keelson.construct_pubsub_key(
-                                base_path=args.realm,
-                                entity_id=args.entity_id,
-                                subject="ecef_z", 
-                                source_id=args.source_id + "/binary",
-                            )
-                            serialized_payload = payload_ecef.SerializeToString()
-                            envelope = keelson.enclose(serialized_payload)
-                            session.put(key_expr=key_exp_pub_ecef_z, payload=envelope,
-                                        priority=zenoh.Priority.INTERACTIVE_HIGH,
-                                        congestion_control=zenoh.CongestionControl.DROP)
-
-                        # Publish Velocity NED
-                        if any(topic in args.publish for topic in ("velocity", "all")):
-                            for i, component in enumerate(['north', 'east', 'down']):
-                                payload_vel = TimestampedFloat()
-                                payload_vel.timestamp.FromDatetime(message_timestamp)
-                                payload_vel.value = pos_data['velocity_ned'][i]
-                                
-                                key_exp_pub_vel = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject=f"velocity_{component}", 
-                                    source_id=args.source_id + "/binary",
-                                )
-                                serialized_payload = payload_vel.SerializeToString()
-                                envelope = keelson.enclose(serialized_payload)
-                                session.put(
-                                    key_expr=key_exp_pub_vel,
-                                    payload=envelope,
-                                    priority=zenoh.Priority.INTERACTIVE_HIGH,
-                                    congestion_control=zenoh.CongestionControl.DROP,
-                                )
-                                logging.debug(f"Published Velocity {component} on {key_exp_pub_vel}")
+                            logging.debug(f"Published Velocity on {key_expressions['velocity']}")
 
                         # Publish Acceleration Body Frame
-                        if any(topic in args.publish for topic in ("acceleration", "all")):
-                            for i, component in enumerate(['x', 'y', 'z']):
-                                payload_acc = TimestampedFloat()
-                                payload_acc.timestamp.FromDatetime(message_timestamp)
-                                payload_acc.value = pos_data['acceleration_body'][i]
-                                
-                                key_exp_pub_acc = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject=f"acceleration_{component}", 
-                                    source_id=args.source_id + "/binary",
-                                )
-                                serialized_payload = payload_acc.SerializeToString()
-                                envelope = keelson.enclose(serialized_payload)
-                                session.put(
-                                    key_expr=key_exp_pub_acc,
-                                    payload=envelope,
-                                    priority=zenoh.Priority.INTERACTIVE_HIGH,
-                                    congestion_control=zenoh.CongestionControl.DROP,
-                                )
-                                logging.debug(f"Published Acceleration {component} on {key_exp_pub_acc}")
+                        if any(topic in args.publish for topic in ("acceleration", "all")) and 'acceleration' in key_expressions:
+                            payload_acc = Decomposed3DVector()
+                            payload_acc.timestamp.FromDatetime(message_timestamp)
+                            payload_acc.vector.x = pos_data['acceleration_body'][0]  # X
+                            payload_acc.vector.y = pos_data['acceleration_body'][1]  # Y
+                            payload_acc.vector.z = pos_data['acceleration_body'][2]  # Z
+
+                            serialized_payload = payload_acc.SerializeToString()
+                            envelope = keelson.enclose(serialized_payload)
+                            session.put(
+                                key_expr=key_expressions['acceleration'],
+                                payload=envelope,
+                                priority=zenoh.Priority.INTERACTIVE_HIGH,
+                                congestion_control=zenoh.CongestionControl.DROP,
+                            )
+                            logging.debug(f"Published Body Acceleration on {key_expressions['acceleration']}")
 
                         # Publish Attitude (Euler angles)
                         if any(topic in args.publish for topic in ("attitude", "all")):
-                            attitude_components = ['heading', 'pitch', 'roll']
-                            for i, component in enumerate(attitude_components):
-                                payload_att = TimestampedFloat()
-                                payload_att.timestamp.FromDatetime(message_timestamp)
-                                payload_att.value = pos_data['attitude'][i]
+                            # Publish heading separately with specific subject name
+                            if 'heading' in key_expressions:
+                                payload_heading = TimestampedFloat()
+                                payload_heading.timestamp.FromDatetime(message_timestamp)
+                                payload_heading.value = pos_data['attitude'][0]  # heading
                                 
-                                key_exp_pub_att = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject=f"attitude_{component}", 
-                                    source_id=args.source_id + "/binary",
-                                )
-                                serialized_payload = payload_att.SerializeToString()
+                                serialized_payload = payload_heading.SerializeToString()
                                 envelope = keelson.enclose(serialized_payload)
                                 session.put(
-                                    key_expr=key_exp_pub_att,
+                                    key_expr=key_expressions['heading'],
                                     payload=envelope,
                                     priority=zenoh.Priority.INTERACTIVE_HIGH,
                                     congestion_control=zenoh.CongestionControl.DROP,
                                 )
-                                logging.debug(f"Published Attitude {component} on {key_exp_pub_att}")
-
-                        # Publish UTC Timestamp
-                        if any(topic in args.publish for topic in ("utc_time", "timing", "all")):
-                            payload_utc = TimestampedTimestamp()
-                            payload_utc.timestamp.FromDatetime(message_timestamp)
-                            payload_utc.value.FromDatetime(utc_timestamp)
+                                logging.debug(f"Published Heading on {key_expressions['heading']}")
                             
-                            key_exp_pub_utc = keelson.construct_pubsub_key(
-                                base_path=args.realm,
-                                entity_id=args.entity_id,
-                                subject="utc_time", 
-                                source_id=args.source_id + "/binary",
-                            )
-                            serialized_payload = payload_utc.SerializeToString()
-                            envelope = keelson.enclose(serialized_payload)
-                            session.put(
-                                key_expr=key_exp_pub_utc,
-                                payload=envelope,
-                                priority=zenoh.Priority.INTERACTIVE_HIGH,
-                                congestion_control=zenoh.CongestionControl.DROP,
-                            )
-                            logging.debug(f"Published UTC Time on {key_exp_pub_utc}")
-
-                        # Publish Result Code
-                        if any(topic in args.publish for topic in ("result_code", "status", "all")):
-                            payload_result = TimestampedInt()
-                            payload_result.timestamp.FromDatetime(message_timestamp)
-                            payload_result.value = pos_data['res_code']
+                            # Publish pitch and roll
+                            if 'pitch' in key_expressions:
+                                payload_pitch = TimestampedFloat()
+                                payload_pitch.timestamp.FromDatetime(message_timestamp)
+                                payload_pitch.value = pos_data['attitude'][1]  # pitch
+                                
+                                serialized_payload = payload_pitch.SerializeToString()
+                                envelope = keelson.enclose(serialized_payload)
+                                session.put(
+                                    key_expr=key_expressions['pitch'],
+                                    payload=envelope,
+                                    priority=zenoh.Priority.INTERACTIVE_HIGH,
+                                    congestion_control=zenoh.CongestionControl.DROP,
+                                )
+                                logging.debug(f"Published Pitch on {key_expressions['pitch']}")
                             
-                            key_exp_pub_result = keelson.construct_pubsub_key(
-                                base_path=args.realm,
-                                entity_id=args.entity_id,
-                                subject="result_code", 
-                                source_id=args.source_id + "/binary",
-                            )
-                            serialized_payload = payload_result.SerializeToString()
-                            envelope = keelson.enclose(serialized_payload)
-                            session.put(
-                                key_expr=key_exp_pub_result,
-                                payload=envelope,
-                                priority=zenoh.Priority.INTERACTIVE_HIGH,
-                                congestion_control=zenoh.CongestionControl.DROP,
-                            )
-                            logging.debug(f"Published Result Code on {key_exp_pub_result}")
+                            if 'roll' in key_expressions:
+                                payload_roll = TimestampedFloat()
+                                payload_roll.timestamp.FromDatetime(message_timestamp)
+                                payload_roll.value = pos_data['attitude'][2]  # roll
+                                
+                                serialized_payload = payload_roll.SerializeToString()
+                                envelope = keelson.enclose(serialized_payload)
+                                session.put(
+                                    key_expr=key_expressions['roll'],
+                                    payload=envelope,
+                                    priority=zenoh.Priority.INTERACTIVE_HIGH,
+                                    congestion_control=zenoh.CongestionControl.DROP,
+                                )
+                                logging.debug(f"Published Roll on {key_expressions['roll']}")
 
-                        # Publish GPS Timing
-                        if any(topic in args.publish for topic in ("gps_timing", "timing", "all")):
-                            payload_timing = TimestampedFloat()
-                            payload_timing.timestamp.FromDatetime(message_timestamp)
-                            payload_timing.value = pos_data['tow']
-                            
-                            key_exp_pub_timing = keelson.construct_pubsub_key(
-                                base_path=args.realm,
-                                entity_id=args.entity_id,
-                                subject="gps_tow", 
-                                source_id=args.source_id + "/binary",
-                            )
-                            serialized_payload = payload_timing.SerializeToString()
-                            envelope = keelson.enclose(serialized_payload)
-                            session.put(
-                                key_expr=key_exp_pub_timing,
-                                payload=envelope,
-                                priority=zenoh.Priority.INTERACTIVE_HIGH,
-                                congestion_control=zenoh.CongestionControl.DROP,
-                            )
-                            logging.debug(f"Published GPS TOW on {key_exp_pub_timing}")
-
-                            # Also publish GPS week
-                            payload_timing.value = pos_data['week']
-                            key_exp_pub_week = keelson.construct_pubsub_key(
-                                base_path=args.realm,
-                                entity_id=args.entity_id,
-                                subject="gps_week", 
-                                source_id=args.source_id + "/binary",
-                            )
-                            serialized_payload = payload_timing.SerializeToString()
-                            envelope = keelson.enclose(serialized_payload)
-                            session.put(
-                                key_expr=key_exp_pub_week,
-                                payload=envelope,
-                                priority=zenoh.Priority.INTERACTIVE_HIGH,
-                                congestion_control=zenoh.CongestionControl.DROP,
-                            )
-
-                        
-                  
-
-     
-     
-
-         
+        
                         
                 except Exception as e:
                     logging.warning(f"Binary parsing error: {e}")
@@ -722,10 +575,10 @@ def main():
                     if len(binary_buffer) > 1000:
                         binary_buffer = binary_buffer[100:]
                 
-                # Prevent buffer from growing too large
-                if len(binary_buffer) > 65536:
+                # Prevent buffer from growing too large - optimized threshold
+                if len(binary_buffer) > max_buffer_size:
                     # Keep only the last portion
-                    binary_buffer = binary_buffer[-32768:]
+                    binary_buffer = binary_buffer[-max_buffer_size//2:]
                     logging.warning("Binary buffer overflow, truncating")
                     
         except KeyboardInterrupt:
