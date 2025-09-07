@@ -1,0 +1,10 @@
+services:
+  anavs-top:
+    build: .
+    # image: ghcr.io/rise-maritime/keelson-connector-anavs:latest
+    container_name: keelson-connector-anavs
+    restart: unless-stopped
+    network_mode: "host"
+    command: ["socat UDP4-RECV:8500,reuseaddr STDOUT | main --log-level 10 -r rise -e ssrs18 -s rutx --publish raw"]
+    
+
