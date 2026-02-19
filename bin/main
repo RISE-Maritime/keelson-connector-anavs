@@ -36,6 +36,41 @@ SYNC_CHAR_2 = 0x62
 CLASS_ID = 0x02
 MESSAGE_ID = 0xE0
 
+STATE_2BIT = {0b00: 0, 0b01: 1, 0b10: 2, 0b11: 3}
+
+def decode_rescode_fields(rescode: int) -> dict:
+    """Expand ANavS resCode (uint16) into plot-friendly scalar signals."""
+    def bit(i: int) -> int:
+        return (rescode >> i) & 1
+
+    def bits(lsb: int, width: int) -> int:
+        return (rescode >> lsb) & ((1 << width) - 1)
+
+    return {
+        "raw": int(rescode),
+
+        # sensor processing bits
+        "gnss_processed": bit(0),
+        "imu_processed": bit(1),
+        "baro_processed": bit(2),
+        "odom_processed": bit(3),
+        "cam_processed": bit(4),
+        "steer_processed": bit(5),
+
+        # system bits
+        "imu_calibrated": bit(6),
+        "filter_reset_epoch": bit(7),
+        "rtk_corrections_initial": bit(8),
+
+        # 2-bit KF states
+        "attitude_kf_state": int(STATE_2BIT.get(bits(9, 2), 255)),
+        "rtk_position_kf_state": int(STATE_2BIT.get(bits(11, 2), 255)),
+
+        # other flags
+        "rtk_refix_candidate": bit(13),
+        "prediction_only": bit(14),
+    }
+
 def fletcher_checksum(data):
     """Calculate Fletcher-16 checksum with modulo 256 as per ANavS spec."""
     # Optimized version using memoryview for better performance
@@ -390,6 +425,51 @@ def main():
                 source_id=args.source_id,
             )
 
+        if any(topic in args.publish for topic in ("status", "all")):
+            # We reuse existing well-known subjects:
+            #   - gnss_aiding_status (TimestampedInt)
+            #   - imu_system_status  (TimestampedInt)
+            #
+            # Each signal becomes its own channel by varying source_id suffix.
+
+            # GNSS / RTK / filter signals
+            gnss_diag_names = [
+                "rescode/raw",
+                "rescode/gnss_processed",
+                "rescode/baro_processed",
+                "rescode/odom_processed",
+                "rescode/cam_processed",
+                "rescode/steer_processed",
+                "rescode/filter_reset_epoch",
+                "rescode/rtk_corrections_initial",
+                "rescode/rtk_refix_candidate",
+                "rescode/prediction_only",
+                "rescode/attitude_kf_state",
+                "rescode/rtk_position_kf_state",
+            ]
+
+            for name in gnss_diag_names:
+                key_expressions[name] = keelson.construct_pubsub_key(
+                    base_path=args.realm,
+                    entity_id=args.entity_id,
+                    subject="gnss_aiding_status",
+                    source_id=f"{args.source_id}/{name}",
+                )
+
+            # IMU-related signals
+            imu_diag_names = [
+                "rescode/imu_processed",
+                "rescode/imu_calibrated",
+            ]
+
+            for name in imu_diag_names:
+                key_expressions[name] = keelson.construct_pubsub_key(
+                    base_path=args.realm,
+                    entity_id=args.entity_id,
+                    subject="imu_system_status",
+                    source_id=f"{args.source_id}/{name}",
+                )
+
         #################################################
         # Setup input stream
 
@@ -567,7 +647,50 @@ def main():
                                 )
                                 logging.debug(f"Published Roll on {key_expressions['roll']}")
 
-        
+                            
+                        # Publish resCode diagnostics
+                        if any(topic in args.publish for topic in ("status", "all")) and "rescode_raw" in key_expressions:
+                            fields = decode_rescode_fields(pos_data["res_code"])
+
+                            publish_map = {
+                                # GNSS/RTK/filter group (subject=gnss_aiding_status)
+                                "rescode/raw": fields["raw"],
+                                "rescode/gnss_processed": fields["gnss_processed"],
+                                "rescode/baro_processed": fields["baro_processed"],
+                                "rescode/odom_processed": fields["odom_processed"],
+                                "rescode/cam_processed": fields["cam_processed"],
+                                "rescode/steer_processed": fields["steer_processed"],
+                                "rescode/filter_reset_epoch": fields["filter_reset_epoch"],
+                                "rescode/rtk_corrections_initial": fields["rtk_corrections_initial"],
+                                "rescode/rtk_refix_candidate": fields["rtk_refix_candidate"],
+                                "rescode/prediction_only": fields["prediction_only"],
+                                "rescode/attitude_kf_state": fields["attitude_kf_state"],
+                                "rescode/rtk_position_kf_state": fields["rtk_position_kf_state"],
+
+                                # IMU group (subject=imu_system_status)
+                                "rescode/imu_processed": fields["imu_processed"],
+                                "rescode/imu_calibrated": fields["imu_calibrated"],
+                            }
+
+                            # Publish each signal as TimestampedInt
+                            for key_name, value in publish_map.items():
+                                key_expr = key_expressions.get(key_name)
+                                if not key_expr:
+                                    continue
+
+                                payload_int = TimestampedInt()
+                                payload_int.timestamp.FromDatetime(message_timestamp)
+                                payload_int.value = int(value)
+
+                                envelope = keelson.enclose(payload_int.SerializeToString())
+                                session.put(
+                                    key_expr=key_expr,
+                                    payload=envelope,
+                                    priority=zenoh.Priority.INTERACTIVE_HIGH,
+                                    congestion_control=zenoh.CongestionControl.DROP,
+                                )
+
+                            logging.debug("Published resCode diagnostics via gnss_aiding_status/imu_system_status")
                         
                 except Exception as e:
                     logging.warning(f"Binary parsing error: {e}")
